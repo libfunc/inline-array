@@ -26,8 +26,7 @@
 //!
 //! # Features
 //!
-//! * `serde` implements `serde::Serialize` and `serde::Deserialize` for `InlineArray` (disabled by
-//! default)
+//! * `serde` implements `serde::Serialize` and `serde::Deserialize` for `InlineArray` (disabled by default)
 //!
 //! # Examples
 //!
@@ -53,7 +52,7 @@ use std::{
 
 #[cfg(feature = "concurrent_map_minimum")]
 impl concurrent_map::Minimum for InlineArray {
-    const MIN: InlineArray = EMPTY;
+    const MIN: InlineArray = InlineArray::EMPTY;
 }
 
 #[cfg(feature = "serde")]
@@ -69,9 +68,6 @@ const SMALL_REMOTE_TRAILER_TAG: u8 = 0b10;
 const BIG_REMOTE_TRAILER_TAG: u8 = 0b11;
 const TRAILER_TAG_MASK: u8 = 0b0000_0011;
 const TRAILER_PTR_MASK: u8 = 0b1111_1100;
-
-/// A const-friendly empty `InlineArray`
-pub const EMPTY: InlineArray = InlineArray([0, 0, 0, 0, 0, 0, 0, INLINE_TRAILER_TAG]);
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,12 +285,16 @@ impl Hash for InlineArray {
 }
 
 impl InlineArray {
+    /// A const-friendly empty `InlineArray`
+    pub const EMPTY: Self = InlineArray([0, 0, 0, 0, 0, 0, 0, INLINE_TRAILER_TAG]);
+
+    /// Create a new `InlineArray` from a slice
     fn new(slice: &[u8]) -> Self {
         let mut data = [0_u8; SZ];
         if slice.len() <= INLINE_CUTOFF {
-            data[SZ - 1] = u8::try_from(slice.len()).unwrap() << 2;
+            data[INLINE_CUTOFF] = u8::try_from(slice.len()).unwrap() << 2;
             data[..slice.len()].copy_from_slice(slice);
-            data[SZ - 1] |= INLINE_TRAILER_TAG;
+            data[INLINE_CUTOFF] |= INLINE_TRAILER_TAG;
         } else if slice.len() <= SMALL_REMOTE_CUTOFF {
             let layout =
                 Layout::from_size_align(slice.len() + size_of::<SmallRemoteTrailer>(), 8).unwrap();
@@ -317,9 +317,9 @@ impl InlineArray {
             // assert that the bottom 3 bits are empty, as we expect
             // the buffer to always have an alignment of 8 (2 ^ 3).
             #[cfg(not(miri))]
-            assert_eq!(data[SZ - 1] & 0b111, 0);
+            assert_eq!(data[INLINE_CUTOFF] & 0b111, 0);
 
-            data[SZ - 1] |= SMALL_REMOTE_TRAILER_TAG;
+            data[INLINE_CUTOFF] |= SMALL_REMOTE_TRAILER_TAG;
         } else {
             let layout =
                 Layout::from_size_align(slice.len() + size_of::<BigRemoteHeader>(), 8).unwrap();
@@ -352,9 +352,73 @@ impl InlineArray {
             // assert that the bottom 3 bits are empty, as we expect
             // the buffer to always have an alignment of 8 (2 ^ 3).
             #[cfg(not(miri))]
-            assert_eq!(data[SZ - 1] & 0b111, 0);
+            assert_eq!(data[INLINE_CUTOFF] & 0b111, 0);
 
-            data[SZ - 1] |= BIG_REMOTE_TRAILER_TAG;
+            data[INLINE_CUTOFF] |= BIG_REMOTE_TRAILER_TAG;
+        }
+        Self(data)
+    }
+
+    /// Create a new `InlineArray` with a given length and zeroed data
+    pub fn with_len(cap: usize) -> Self {
+        let mut data = [0_u8; SZ];
+        if cap <= INLINE_CUTOFF {
+            data[INLINE_CUTOFF] = u8::try_from(cap).unwrap() << 2;
+            data[INLINE_CUTOFF] |= INLINE_TRAILER_TAG;
+        } else if cap <= SMALL_REMOTE_CUTOFF {
+            let layout = Layout::from_size_align(cap + size_of::<SmallRemoteTrailer>(), 8).unwrap();
+
+            let trailer = SmallRemoteTrailer {
+                rc: 1.into(),
+                len: u8::try_from(cap).unwrap(),
+            };
+
+            unsafe {
+                let data_ptr = alloc(layout);
+                assert!(!data_ptr.is_null());
+                let trailer_ptr = data_ptr.add(cap);
+
+                std::ptr::write(trailer_ptr as *mut SmallRemoteTrailer, trailer);
+                std::ptr::write_unaligned(data.as_mut_ptr() as _, trailer_ptr);
+            }
+
+            // assert that the bottom 3 bits are empty, as we expect
+            // the buffer to always have an alignment of 8 (2 ^ 3).
+            assert_eq!(data[INLINE_CUTOFF] & 0b111, 0);
+
+            data[INLINE_CUTOFF] |= SMALL_REMOTE_TRAILER_TAG;
+        } else {
+            let layout = Layout::from_size_align(cap + size_of::<BigRemoteHeader>(), 8).unwrap();
+
+            let slice_len_buf: [u8; 8] = (cap as u64).to_le_bytes();
+
+            let len: [u8; BIG_REMOTE_LEN_BYTES] = [
+                slice_len_buf[0],
+                slice_len_buf[1],
+                slice_len_buf[2],
+                slice_len_buf[3],
+                slice_len_buf[4],
+                slice_len_buf[5],
+            ];
+            assert_eq!(slice_len_buf[6], 0);
+            assert_eq!(slice_len_buf[7], 0);
+
+            let header = BigRemoteHeader { rc: 1.into(), len };
+
+            unsafe {
+                let header_ptr = alloc(layout);
+                assert!(!header_ptr.is_null());
+                let _data_ptr = header_ptr.add(size_of::<BigRemoteHeader>());
+
+                std::ptr::write(header_ptr as *mut BigRemoteHeader, header);
+                std::ptr::write_unaligned(data.as_mut_ptr() as _, header_ptr);
+            }
+
+            // assert that the bottom 3 bits are empty, as we expect
+            // the buffer to always have an alignment of 8 (2 ^ 3).
+            assert_eq!(data[INLINE_CUTOFF] & 0b111, 0);
+
+            data[INLINE_CUTOFF] |= BIG_REMOTE_TRAILER_TAG;
         }
         Self(data)
     }
@@ -362,9 +426,9 @@ impl InlineArray {
     fn remote_ptr(&self) -> *const u8 {
         assert_ne!(self.kind(), Kind::Inline);
         let mut copied = self.0;
-        copied[SZ - 1] &= TRAILER_PTR_MASK;
+        copied[INLINE_CUTOFF] &= TRAILER_PTR_MASK;
 
-        unsafe { std::ptr::read((&copied).as_ptr() as *const *const u8) }
+        unsafe { std::ptr::read(copied.as_ptr() as *const *const u8) }
     }
 
     fn deref_small_trailer(&self) -> &SmallRemoteTrailer {
@@ -409,7 +473,7 @@ impl InlineArray {
 
     #[cfg(not(miri))]
     const fn inline_trailer(&self) -> u8 {
-        self.0[SZ - 1]
+        self.0[INLINE_CUTOFF]
     }
 
     /// This function returns a mutable reference to the inner
@@ -478,7 +542,7 @@ impl InlineArray {
 
     /// Similar in spirit to [`std::boxed::Box::from_raw`].
     ///
-    /// # Unsafe contract
+    /// # Safety
     ///
     /// * Must only be used with a `NonZeroU64` that was produced from [`InlineArray::into_raw`]
     /// * When an [`InlineArray`] drops, it decrements a reference count (if its size is over the inline threshold)
